@@ -1,46 +1,50 @@
 """
 LLM synthesis node — generates a veterinary answer from retrieved chunks.
-Sits between the Calculator and the Garde-Fou in the graph.
 """
 
-import re
 from langchain_ollama import ChatOllama
 from src.agents.state import VetState
 
-_llm = ChatOllama(model="llama3.2:3b", temperature=0.1)
+_llm = ChatOllama(model="llama3.2:3b", temperature=0.0)
 
-SYNTHESIS_PROMPT = """You are a veterinary drug compliance assistant.
-Using the drug notice excerpts and dosage calculation below, write a clear,
-accurate answer to the veterinary question. Always cite the product name.
-Never invent dosages not present in the excerpts. Answer in the same language
-as the question.
+SYNTHESIS_PROMPT = """Tu es un assistant réglementaire vétérinaire.
+Réponds à la question en utilisant UNIQUEMENT les informations ci-dessous.
+N'effectue AUCUN calcul. Recopie exactement le résultat de calcul fourni.
 
 Question: {query}
 
-Dosage calculation: {calculation}
+Résultat de calcul officiel (NE PAS MODIFIER): {calculation}
+Molécule: {molecule}
+Espèce: {species}
+Voie d'administration: {route}
+Notes: {notes}
 
-Drug notice excerpts:
-{chunks}
+Extrait de notice source ({product}):
+{chunk}
 
-Answer:"""
+Rédige une réponse courte et factuelle en français. Cite le nom du produit.
+Ne recalcule pas. Ne modifie pas le résultat de calcul."""
 
 
 def llm_node(state: VetState) -> VetState:
-    """Generate a synthesized answer from chunks and calc_result."""
-    query       = state["query"]
-    chunks      = state["chunks"]
-    calc_result = state["calc_result"]
+    calc   = state["calc_result"]
+    chunks = state["chunks"]
 
-    chunks_text = "\n---\n".join(c["text"][:300] for c in chunks[:3])
-    calculation = calc_result.get("calculation", "No calculation available")
+    product = chunks[0]["metadata"]["product_name"] if chunks else "inconnu"
+    chunk   = chunks[0]["text"][:400] if chunks else ""
 
-    prompt   = SYNTHESIS_PROMPT.format(
-        query=query,
-        calculation=calculation,
-        chunks=chunks_text,
+    prompt = SYNTHESIS_PROMPT.format(
+        query      = state["query"],
+        calculation= calc.get("calculation", "non disponible"),
+        molecule   = calc.get("molecule", "inconnue"),
+        species    = calc.get("species", "inconnue"),
+        route      = calc.get("route", "non précisée"),
+        notes      = calc.get("notes", "aucune"),
+        product    = product,
+        chunk      = chunk,
     )
+
     response = _llm.invoke(prompt)
     answer   = response.content.strip()
-
     print(f"[LLM] Answer generated ({len(answer)} chars)")
     return {**state, "answer": answer}
