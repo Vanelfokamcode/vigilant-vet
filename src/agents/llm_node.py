@@ -1,11 +1,13 @@
-"""
-LLM synthesis node — generates a veterinary answer from retrieved chunks.
-"""
-
-from langchain_ollama import ChatOllama
 from src.agents.state import VetState
+from src.agents.gemini_client import GeminiClient
 
-_llm = ChatOllama(model="llama3.2:3b", temperature=0.0)
+_llm = None
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        _llm = GeminiClient()
+    return _llm
 
 SYNTHESIS_PROMPT = """Tu es un assistant réglementaire vétérinaire.
 Réponds à la question en utilisant UNIQUEMENT les informations ci-dessous.
@@ -27,24 +29,21 @@ Ne recalcule pas. Ne modifie pas le résultat de calcul."""
 
 
 def llm_node(state: VetState) -> VetState:
-    calc   = state["calc_result"]
-    chunks = state["chunks"]
-
+    calc    = state["calc_result"]
+    chunks  = state["chunks"]
     product = chunks[0]["metadata"]["product_name"] if chunks else "inconnu"
     chunk   = chunks[0]["text"][:400] if chunks else ""
-
-    prompt = SYNTHESIS_PROMPT.format(
-        query      = state["query"],
-        calculation= calc.get("calculation", "non disponible"),
-        molecule   = calc.get("molecule", "inconnue"),
-        species    = calc.get("species", "inconnue"),
-        route      = calc.get("route", "non précisée"),
-        notes      = calc.get("notes", "aucune"),
-        product    = product,
-        chunk      = chunk,
+    prompt  = SYNTHESIS_PROMPT.format(
+        query       = state["query"],
+        calculation = calc.get("calculation", "non disponible"),
+        molecule    = calc.get("molecule", "inconnue"),
+        species     = calc.get("species", "inconnue"),
+        route       = calc.get("route", "non précisée"),
+        notes       = calc.get("notes", "aucune"),
+        product     = product,
+        chunk       = chunk,
     )
-
-    response = _llm.invoke(prompt)
+    response = get_llm().invoke(prompt)
     answer   = response.content.strip()
     print(f"[LLM] Answer generated ({len(answer)} chars)")
     return {**state, "answer": answer}

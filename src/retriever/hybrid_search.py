@@ -1,16 +1,5 @@
-"""
-Hybrid search combining ChromaDB vector search and BM25 keyword search.
-Results are fused via Reciprocal Rank Fusion (RRF).
-
-Why hybrid:
-- Vector search: good on semantics, bad on exact molecule names
-- BM25: good on exact keywords, bad on paraphrase
-- RRF: covers both cases without tuning extra parameters
-"""
-
 import pickle
 from pathlib import Path
-
 import chromadb
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
@@ -21,83 +10,49 @@ BM25_PATH     = DATA_DIR / "bm25_corpus.pkl"
 COLLECTION    = "anmv_notices"
 EMBED_MODEL   = "sentence-transformers/all-MiniLM-L6-v2"
 
-RRF_K = 60
-
-
 class HybridSearcher:
-    """
-    Loads ChromaDB collection and BM25 index once at init.
-    Call .search(query, k) to retrieve top-k chunks.
-    """
-
     def __init__(self):
-        print("[HybridSearcher] Loading vector store...")
         self.model      = SentenceTransformer(EMBED_MODEL)
         self.client     = chromadb.PersistentClient(path=str(CHROMA_DIR))
         self.collection = self.client.get_collection(COLLECTION)
-
-        print("[HybridSearcher] Loading BM25 corpus...")
         with open(BM25_PATH, "rb") as f:
             corpus = pickle.load(f)
-
         self.chunks    = corpus["chunks"]
         self.metadatas = corpus["metadatas"]
         tokenized      = [doc.lower().split() for doc in self.chunks]
         self.bm25      = BM25Okapi(tokenized)
-        print(f"[HybridSearcher] Ready — {len(self.chunks)} chunks indexed")
-
-    def _vector_search(self, query: str, k: int) -> list[tuple[int, str, dict]]:
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=min(k * 2, self.collection.count()),
-        )
-        docs      = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        return [(i, doc, meta) for i, (doc, meta) in enumerate(zip(docs, metadatas))]
-
-    def _bm25_search(self, query: str, k: int) -> list[tuple[int, str, dict]]:
-        scores  = self.bm25.get_scores(query.lower().split())
-        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k * 2]
-        return [(rank, self.chunks[idx], self.metadatas[idx])
-                for rank, idx in enumerate(top_idx)]
-
-    def _rrf_merge(
-        self,
-        vec_results: list[tuple[int, str, dict]],
-        bm25_results: list[tuple[int, str, dict]],
-        k: int,
-    ) -> list[dict]:
-        """
-        Score = sum(1 / (RRF_K + rank)) across both result lists.
-        Higher score = better combined rank.
-        """
-        scores: dict[str, float] = {}
-        texts:  dict[str, str]   = {}
-        metas:  dict[str, dict]  = {}
-
-        for rank, text, meta in vec_results:
-            key = text[:120]
-            scores[key] = scores.get(key, 0) + 1 / (RRF_K + rank + 1)
-            texts[key]  = text
-            metas[key]  = meta
-
-        for rank, text, meta in bm25_results:
-            key = text[:120]
-            scores[key] = scores.get(key, 0) + 1 / (RRF_K + rank + 1)
-            texts[key]  = text
-            metas[key]  = meta
-
-        ranked = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)[:k]
-        return [
-            {"text": texts[key], "metadata": metas[key], "score": round(scores[key], 4)}
-            for key in ranked
-        ]
 
     def search(self, query: str, k: int = 5) -> list[dict]:
-        """
-        Main entry point. Returns top-k chunks with metadata and RRF score.
-        Each result: {"text": str, "metadata": dict, "score": float}
-        """
-        vec_results  = self._vector_search(query, k)
-        bm25_results = self._bm25_search(query, k)
-        return self._rrf_merge(vec_results, bm25_results, k)
+        query_upper = query.upper()
+        # On extrait les mots importants (Noms de produits)
+        keywords = [w for w in query_upper.replace("'", " ").split() if len(w) > 3]
+        
+        scores = {}
+        
+        # On parcourt TOUS les chunks pour trouver le produit EXACT (Brute force sur les noms)
+        for i, meta in enumerate(self.metadatas):
+            doc = self.chunks[i]
+            p_name = meta.get("product_name", "").upper()
+            
+            # Si le nom du produit est dans la question
+            for kw in keywords:
+                if kw in p_name:
+                    key = doc[:120]
+                    # BOOST MASSIF si c'est le bon produit ET la section Posologie
+                    bonus = 10.0 if kw in p_name else 0.0
+                    if "3.9" in doc or "POSOLOGIE" in doc.upper() or "MG/KG" in doc.upper():
+                        bonus += 5.0
+                    
+                    score = bonus + (1 / (60 + i + 1))
+                    if key not in scores or score > scores[key]["score"]:
+                        scores[key] = {"text": doc, "metadata": meta, "score": score}
+
+        # Si on n'a rien trouvé avec le nom, on utilise le vectoriel en secours
+        if not scores:
+            v_res = self.collection.query(query_texts=[query], n_results=10)
+            for i, (doc, meta) in enumerate(zip(v_res["documents"][0], v_res["metadatas"][0])):
+                key = doc[:120]
+                scores[key] = {"text": doc, "metadata": meta, "score": 1/(60+i)}
+
+        sorted_res = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+        return sorted_res[:k]
